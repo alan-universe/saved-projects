@@ -152,25 +152,21 @@ glance(fit)
 
 
 ```
-*This is where I think I need help understanding, I am working with a transformed version of the data that is made up of square-root values, I have also come to the conclusion that it benefits from first differencing. Am I estimating these models correctly by including a constant of 1? What does including a constant even do?*
 It appears that our initial guess does indeed give us the lowwest AICc score. We will now go ahead and run a Ljung-Box test to see if there is any serial correlation still present in our model. If there is not, our selected model has achieved stationarity and we can proceed to forecast with it. 
 ```{r}
 finalMODEL=FinalTrainingSet%>%model(ARIMA(square_root~1+pdq(1,1,1)+PDQ(4,0,0)))
 finalMODEL%>%gg_tsresiduals(lag=45)
 augment(finalMODEL)%>%features(.innov,ljung_box,lag=30,dof=)
 ```
-*how do I determine how many degrees of freedom I need to include?*
 
 ##Forecasting with Our Final SARIMA Model
 In order to judge the accurary of our model, we'll be plotting a forecast horizon of 4 observations along with the actual observed data. 
-*how do I use my model to forecast values and not square_root values?*
 ```{r}
 
 ```
-*after reading the notes you provided I think I confused myself, I thought that spikes in the ACF coincided with the moving average, as in q & Q and the PACF vice versa, is this not correct? For example, please look at how I break down the plots starting in line 142 * 
 
 ##Forecasting with a Single-Layer Feed-Forward Nueral Network 
-*Since we cannot account for seasonality in the sense of yearly trends like we did with ETS & SARIMA models using Fourier terms, would it be better to just drop the period alltogther? Or maybe include a period to try to model how the virus mutates and becomes more infectious throughout the year? (maybe it mutates every couple months? (period=60))*
+
 
 ## Sources Cited
 https://www.kxan.com/news/coronavirus/365-days-of-covid-how-the-coronavirus-in-texas-unfolded-one-year-after-the-first-case/
