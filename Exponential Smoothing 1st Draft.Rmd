@@ -1,0 +1,121 @@
+---
+title: 'Simple to Advanced: Exponential Smoothing'
+author: "Alan Calvillo"
+date: "12/20/2021"
+output: pdf_document
+---
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+library(fpp3)
+library(tidyverse)
+```
+
+```{r message=FALSE, echo=FALSE}
+temp=readr::read_csv("atmosphericCO2.csv")
+atmos=temp%>%mutate(Obs=yearmonth(Obs))%>%as_tsibble(index=Obs)
+train_atmos=atmos%>%filter_index("1958 Mar" ~ "2020 Dec")
+```
+
+## Introduction
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents within R Studio. We'll be using a data set comprised of real world monthly observations of CO2 levels in the Earths atmosphere to demonstrate simple, to advanced exponential smoothing models. The data set used comes by courtesy of the 'Global Monitoring Laboratory' and can found at:            
+https://gml.noaa.gov/ccgg/trends/data.html
+
+## What is Exponential Smoothing (ETS)?
+
+Exponential Smoothing is a simple forecasting method that uses weighted averages of past observations to produce reliable forecasts of time-series data. The model consists of several equations that can account for trend and seasonality, but we'll start with the simplest form to compare results and demonstrate the accuracy of models made with good intuition.
+
+\newpage
+
+## Simple Exponential Smoothing (SES)
+
+The weighted averages estimated by this model decay in value the further back the observation is, putting more weight on recent observations than past ones. SES only accounts for the smoothed values of each observation, i.e. the value of an observation after taking into account the previous weighted average. Using our CO2 data, forecasting a 12 step-ahead horizon, yields the following result.
+
+```{r}
+SES=train_atmos%>%model(ETS(CO2 ~ error("A") + trend("N") + season("N")))
+
+SES%>%forecast(h=12)%>%
+  autoplot(filter_index(train_atmos,"2018 Jan" ~ "2021 Jan"))+
+  labs(y="CO2 PPM",
+       x="Monthly Global Observations",
+       title="One Year Projection Using SES")
+```
+
+Obviously this model needs improvement, The black line represents the real world values of CO2 levels in the atmosphere, and we can see that the horizon of our forecast is just flat/constant. Luckily we can add seasonality and trend equations to our model to do a better job of capturing the upper and lower bounds of the data.
+
+\newpage
+
+## ETS with Trend Component AKA Holt's Method
+
+This is where a data scientists' intuition begins to come into play. We'll start by plotting the entire time-series of our data to see if there is evidence of trend and if so, what kind.
+
+```{r}
+train_atmos%>%autoplot(CO2)+
+  labs(y="CO2 PPM", x="Monthly Global Observations",
+       title="Historical Atmospheric CO2 Data")
+```
+
+Looking at the graph, its very clear that there is a positive trend in our data that shows no evidence of decreasing at any point. We'll now create a model with an additive trend piece, forecast a 12 step horizon, and layer it into the previous graph including the simple model done before.
+
+```{r}
+Example2=train_atmos%>%model(SES=ETS(CO2 ~ error("A") + trend("N") + season("N")),
+                             HLT=ETS(CO2 ~ error("A") + trend("A") + season("N")))
+
+Example2%>%forecast(h=12)%>%
+  autoplot(filter_index(train_atmos,"2018 Jan" ~ "2021 Jan"),level=20)+
+  labs(y="CO2 PPM", x="Monthly Global Observations",
+       title="1 Year Projections of SES & ETS+Trend")
+```
+
+Right away we can see that the SES model with additive trend (HLT) does a much better job of forecasting CO2 levels. The only problem is that while it captures the overall trending direction of our data, it does not capture any of the yearly increasing/decreasing movement. To do this we'll add a seasonal equation to our model, but first we'll make a seasonal plot to check what type of seasonal component appears most appropriate.
+
+\newpage
+
+## Full ETS AKA Holt-Winter's Method
+
+```{r}
+train_atmos%>%gg_season(y=CO2)+labs(y="CO2 PPM", x="Monthly Global Observations")
+```
+
+Looking at this seasonal plot, we can see that there definitely appears to be an increase in our CO2 levels beginning in the colder months of the year and declining in the warmer months. We can also see that the scale of these seasonal changes appear to go unchanged throughout the years. This is characteristic of an additive seasonal component and we will now proceed to forecast with it.
+
+```{r}
+Example3=train_atmos%>%model(SES=ETS(CO2 ~ error("A") + trend("N") + season("N")),
+                             HLT=ETS(CO2 ~ error("A") + trend("A") + season("N")),
+                             HWM=ETS(CO2 ~ error("A") + trend("A") + season("A")))
+
+Example3%>%forecast(h=12)%>%
+  autoplot(filter_index(train_atmos,"2018 Jan" ~ "2021 Jan"),level=20)+
+  labs(title="1 Year Projections of SES, ETS+Trend, & Full ETS",
+       y="CO2 PPM", x="Monthly Global Observations",)
+```
+
+Finally, we see the full power of exponential smoothing. The accuracy of the final model labeled "HWM" is exacerbated when compared to the previous models done before.
+
+\newpage
+
+## How Accurate is the Final Model?
+
+Very! Just to prove it we can plot the actual observed values of CO2 for the first 8 months of 2021 along with the predicted values for those months estimated by our model.
+
+```{r, echo=FALSE}
+FinalModel=train_atmos%>%model(ETS(CO2 ~ error("A") + trend("A") + season("A")))
+
+FinalModel%>%forecast(h=8)%>%
+  autoplot(filter_index(atmos,"2018 Jan" ~ "2021 Aug"),level=95)+
+  labs(title="Actual Values vs Predicted Values", y="CO2 PPM",
+       x="Monthly Global Observations")
+
+```
+
+To get an even clearer picture, we can pull the real world values and the predicted values from our model and compare them. We can also use the 'Root Mean Squared Error (RMSE)' statistic to get a better sense of how accurate the prediction is.
+
+```{r, echo=FALSE}
+print('Actual Observed Values (CO2) vs Predicted Values')
+Predicted=FinalModel%>%forecast(h=8)
+actualCO2=(filter_index(atmos,"2021 Jan" ~ "2021 Aug"))%>%as.data.frame()
+actualCO2%>%mutate(Predicted=Predicted$.mean)
+
+Predicted%>%accuracy(atmos)%>%select(.model,RMSE)%>%as.data.frame()
+```
+Generally speaking, the RMSE implies that on average, our error is only 0.358 parts per million. This is an incredibly small margin given our relatively simple model, which just goes to show that even a simple statistical model like exponential smoothing can be very accurate when used effectively.

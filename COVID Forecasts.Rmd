@@ -1,0 +1,177 @@
+---
+title: Forecasting COVID Cases in Tarrant County, TX using Autocorrelation & Machine-Learning Models
+author: "Alan Calvillo"
+date: "12/21/2021"
+output: pdf_document
+---
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+library(fpp3)
+library(urca)
+library(ggplot2)
+library(lubridate)
+library(dplyr)
+library(tidyverse)
+library(slider)
+library(ggpmisc)
+library(forecast)
+```
+## I. Introduction
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. The purpose of this study was to compare and contrast two distinct forecasting models to see if we could accurately predict new confirmed COVID cases in Tarrant County, Texas. The data set we will be working with comes courtesy of the Texas Department of State Health Services. It is publically available and can be found at: 
+https://dshs.texas.gov/coronavirus/AdditionalData.aspx
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+temp=readr::read_csv("Tarrant NEWNEW.csv")
+temp=temp%>%mutate(date=mdy(date))
+covid=temp%>%as_tsibble(index=date)
+```
+
+## II. Condition of the Dataset
+Before we can proceed to our forecasting methods, there are a number of housekeeping issues we need to address. These issues include: (1) dealing with count data, (2) optimizing our sample size, (3) dealing with inconsistencies in data collection, & (4) transforming the data.
+
+## 1. Dealing with Count Data
+In statistics, count data is any observation that can only be counting numbers, i.e. non-negative integer values such as 0, 1, 2, 3, etc. Issues can arise when data contains small counts (anything <100), this would require us to use models with different distributional assumptions, which can become complicated rather quickly. Luckily (depending on how you look at it) the number of daily COVID cases in Texas are quite large, meaning it won't be necessary to employ these more complicated models. There are however, a couple of things we can do to improve the statistical power of our models. Which brings us to our next issue.
+
+## 2. Optimizing our Sample Size
+As previously discussed, small count numbers can prove to be detrimental to the estimates of our statistical models. The data set pulled from the Texas DSHS website begins its observations on March 4, 2020, which was the first presumptive case of COVID-19 in the state (Adams).
+```{r}
+autoplot(filter_index(covid,"2020-03-04"~"2020-04-15"))+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+       title="Raw Data Plot From March 4th to April 15th")+
+  ylim(0,150)+stat_peaks(colour="red")+
+  stat_peaks(geom="text",colour="red",x.label.fmt="%D",span=7, hjust=1.2,angle=320,ignore_threshold=0.1)
+```
+While March 4th is the begginning of our data set, we can see from the graph above that March 24th is when our data really starts accumulating. Because the first 20 observations are relatively close to zero, we can exclude them from our the training set we'll be working with. We'll do this by creating a new object that filters out these unnecessary observations, naming it "covidOpt".
+```{r}
+covidOpt=covid%>%filter_index("2020-03-24"~"2021-11-02")
+#forecast horizon of 7 days 2021-11-09
+```
+
+## 3. Dealing with Inconsistencies in Data Collection
+One issue that becomes aware to us when taking a glance of the full data set is that there appears to be zero cases reported throughout. This may be due to week-day effects, which we can further examined by creating a weekly subseries plot. 
+``` {r}
+covidOpt%>%gg_subseries(cases,period=7)
+```
+We can see from the sub-series plot that Sunday appears to have the lowwest value mean, while Monday appears to have the highest. This coincides with our theory of week-day effects, just to be sure we can further investigate this witht the estimation of weekday dummy variables. The following code uses a for-loop along with a sequence of if-conditionals to calculate weekday dummies. We can use these dummies to create a regression with that will give us estimates for these weekday values.
+```{r}
+dayWEEK=covidOpt$date%>%wday()
+MON=rep(0,589)
+TUE=rep(0,589)
+WED=rep(0,589)
+THU=rep(0,589)
+FRI=rep(0,589)
+SAT=rep(0,589)
+SUN=rep(0,589)
+for (j in 1:589)
+{
+  if (dayWEEK[j]==1)
+    {SUN[j]=1}
+  else if (dayWEEK[j]==2)
+  {MON[j]=1}
+  else if (dayWEEK[j]==3)
+  {TUE[j]=1}
+  else if (dayWEEK[j]==4)
+  {WED[j]=1}
+  else if (dayWEEK[j]==5)
+  {THU[j]=1}
+  else if (dayWEEK[j]==6)
+  {FRI[j]=1}
+  else if (dayWEEK[j]==7)
+  {SAT[j]=1}
+}
+
+WeekdayEst=covidOpt%>%mutate(MON=MON,TUE=TUE,WED=WED,THU=THU,FRI=FRI,SAT=SAT,SUN=SUN)
+report(WeekdayEst%>%model(TSLM(cases~MON+TUE+WED+THU+FRI+SAT+SUN+0)))
+```
+This again confirms our hypothesis of error in our data collection, as Sunday is estimated to have the lowwest COVID case counts and Monday the highest. One way we can work around this is to employ moving averages in our training set. Here the term moving average takes a more literal definition, meaning that the averages move in a certain way within the data set. Mainstream statistics often employ this technique when presenting case counts to the public. We can do the same thing using a feature that averages a sequence of data points. 
+```{r}
+covidMA=covidOpt%>%mutate(MovingAverage=slider::slide_dbl(cases,mean,
+                              .before=3,.after=3,complete=TRUE))
+
+covidMA%>%pivot_longer(c(MovingAverage,cases),names_to="COVID Data")%>%
+  autoplot(value)+
+  labs(y="COVID CASES",x="Daily Observations",title="COVID cases and a 7-day centered moving average")
+```
+Finally we see just how impactful the inclusion of a moving average can be. In laymans terms, the blue 'Moving Average' plot is closer to the actual daily COVID cases after taking into account weekends and holidays in which no cases were recorded due to data collectors not working those days. This brings us to our fourth and final housekeepig chore, dealing with stationarity.
+
+## Transforming the Data
+ Stationarity of a time-series can be simply defined as statistical properties of a time series that do not change over time. Most analytic methods and models rely on stationarity in order to accurately predict patterns in the data. There are several statistical test we will employ to see if, and how, differencing our data would be beneficiary. But before we do this we'll take a look at a plot of the entire time-series to see if any transformations can be made to simplify the patterns in our data. This will only help us in the long run, making model selection much easier and increasing the accuracy of our models.
+```{r}
+autoplot(covidMA,MovingAverage)+labs(x="Daily Observations",
+                              y="New Confirmed COVID Cases",
+                              title="Moving Average Data Plot of our entire Time-Series")
+```
+ Due to the huge changes in variability present in our data, it appears that a transformation of some sort would indead be necessary. We can rule out a logarithmic transformation because zeros are present throughout our data and would only further complicate our results. A transformation we could do here would be a square-root transformation using the box-cox feature within R. 
+```{r}
+lambdasqrt=0.50
+FinalTrainingSet=covidMA%>%mutate(square_root=box_cox(cases,lambdasqrt))
+FinalTrainingSet%>%pivot_longer(c(cases,square_root),names_to="COVID Data")%>%
+  autoplot(value)+labs(x="Daily Observations",y="New Confirmed COVID Cases",
+                       title="Original & Square Root Moving Average Data Plot")
+
+autoplot(FinalTrainingSet,value)+aes(x=date,y=square_root)+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+                              title="Square Root Moving Average Data Plot")
+```
+This time-series would require us to transform our forecasting results, but appears to fix the problems we had with volatility. We'll now continue with our other tests, the first of which being a unit-root test known as the Kwiatkowski-Phillips-Schmidt-Shin test, KPSS test for short. There are functions we can use that use a sequence of KPSS tests to determine the appropriate number of first differences to apply to our data set. The first one we'll use tests for the presence of seasonal unit-roots, and the second one will test for non-seasonal unit-roots.
+```{r}
+FinalTrainingSet%>%features(square_root,unitroot_nsdiffs)
+FinalTrainingSet%>%features(square_root,unitroot_ndiffs)
+```
+The tests indicate that a seasonal difference will not be necessary for our data set, which makes sense given there is only about one years worth of data to check. There does however appear to be evidence that our data would benefit from non-seasonal first differencing. To further examine this we'll difference our training set and run a single KPSS test to see if the data does indeed benefit from being differenced.
+```{r}
+FinalTrainingSet%>%mutate(diff_cases = difference(square_root))%>%
+  features(diff_cases,unitroot_kpss)
+```
+The null hypothesis (H0) of the KPSS test is that the data is stationary, therefore not requiring differencing. Here the estimated p-value of 0.10 is larger than our test statistic of 0.02. This means that we fail to reject the H0 that our data is stationary and it indeed benefits from being differenced. Now we'll run a seperate unit-root test known as the 'Augmented Dickey-Fuller' test (ADF). This test is far less complicated than the KPSS test and can be used to confirm our previous results. Here the H0 is that a unit-root is present in the data and needs to be differenced, the opposite hypothesis of the KPSS test.
+```{r}
+sqrtTS=as.ts(select(FinalTrainingSet,square_root))
+summary(ur.df(sqrtTS,type="drift",lags=50,selectlags="AIC"))
+```
+In this first run we allow up to 50 lags and let R select the optimal amount which appears to be 29. We compare the tau2 5% critical value of -2.86 to the t-stat of -2.0929. Since -2.0929 > -2.86, we fail to reject the H0 and evidence suggests that a unit root may be present in our data. This confirms the same result we got from the first KPSS test. We'll now run the test again with the data differenced and the optimal number of lags selected by the initial run.
+```{r}
+summary(ur.df(diff(sqrtTS),type="trend",lags=29,selectlags="Fixed"))
+```
+Here our test-statistic < critical-value (-4.5538<-3.41), meaning we reject the H0. This along with the result of the KPSS tests confirms that our data indeed benefits from being differenced. We can conclude that d=1 for any models that requires a non-seasonal differencing value, and can proceed to our initial model selection.
+
+##  First Model: Seasonal AutoRegressive Intergrated Moving Average (SARIMA)
+ARIMA models are made up of equations that account for autoregression, moving-average, and differencing. Seasonal ARIMA models (SARIMA for short) include all of these components twice, once for seasonality and once for non-seasonality. We have already concluded that the degree of first differencing involved for our non-seasonal component is one (d=1), and zero for the seasonal component (D=0). Now we can use auto-correlations and partial auto-correlation graphs to estimate the order of autoregressive parts (p & P) and the order of the moving average parts (q & Q).
+```{r}
+FinalTrainingSet%>%gg_tsdisplay((square_root)%>%difference(),plot_type="partial",
+                                lag_max=45)
+```
+Because we're working with daily count data, any seasonal implications will occur at every *7th* lag. Right away we see that there is indeed some seasonality in the MA part of our data. We see that the last seasonal spike appears at our 28th lag of the ACF, characteristic of Q=4. There does not appear to be any seasonality in the AR part due to there not being any significant seasonal lags in the PACF. What we do see is major spikes of the first lag in both the ACF & PACF, characteristic of an AR(1) & MA(1). Given these observations, we can move forward with a candidate SARIMA model of (1,1,1)x(0,0,4). We'll include other guesses with different MA values and seasonal AR values, along with an automatically generated model, and compare their AICc statistics to choose a final model.
+```{r}
+fit=FinalTrainingSet%>%model(
+  initialguess=ARIMA(square_root~1+pdq(1,1,1)+PDQ(4,0,0)),
+  MA_4=ARIMA(square_root~1+pdq(6,1,1)+PDQ(0,0,4)),
+  sAR_2=ARIMA(square_root~1+pdq(1,1,1)+PDQ(2,0,0)),
+  sMA_2=ARIMA(square_root~1+pdq(1,1,1)+PDQ(4,0,2)),
+  guessauto=ARIMA(square_root)
+)
+glance(fit)
+
+
+```
+*This is where I think I need help understanding, I am working with a transformed version of the data that is made up of square-root values, I have also come to the conclusion that it benefits from first differencing. Am I estimating these models correctly by including a constant of 1? What does including a constant even do?*
+It appears that our initial guess does indeed give us the lowwest AICc score. We will now go ahead and run a Ljung-Box test to see if there is any serial correlation still present in our model. If there is not, our selected model has achieved stationarity and we can proceed to forecast with it. 
+```{r}
+finalMODEL=FinalTrainingSet%>%model(ARIMA(square_root~1+pdq(1,1,1)+PDQ(4,0,0)))
+finalMODEL%>%gg_tsresiduals(lag=45)
+augment(finalMODEL)%>%features(.innov,ljung_box,lag=30,dof=)
+```
+*how do I determine how many degrees of freedom I need to include?*
+
+##Forecasting with Our Final SARIMA Model
+In order to judge the accurary of our model, we'll be plotting a forecast horizon of 4 observations along with the actual observed data. 
+*how do I use my model to forecast values and not square_root values?*
+```{r}
+
+```
+*after reading the notes you provided I think I confused myself, I thought that spikes in the ACF coincided with the moving average, as in q & Q and the PACF vice versa, is this not correct? For example, please look at how I break down the plots starting in line 142 * 
+
+##Forecasting with a Single-Layer Feed-Forward Nueral Network 
+*Since we cannot account for seasonality in the sense of yearly trends like we did with ETS & SARIMA models using Fourier terms, would it be better to just drop the period alltogther? Or maybe include a period to try to model how the virus mutates and becomes more infectious throughout the year? (maybe it mutates every couple months? (period=60))*
+
+## Sources Cited
+https://www.kxan.com/news/coronavirus/365-days-of-covid-how-the-coronavirus-in-texas-unfolded-one-year-after-the-first-case/
+
