@@ -1,0 +1,497 @@
+---
+title: Forecasting COVID Cases in Tarrant County, TX using Autocorrelation & Machine-Learning Models
+author: "Alan Calvillo"
+date: "12/21/2021"
+output: 
+  rmarkdown::github_document: 
+  fig_width: 6
+---
+```{r include=FALSE}
+library(fpp3)
+library(urca)
+library(ggplot2)
+library(lubridate)
+library(dplyr)
+library(tidyverse)
+library(slider)
+library(ggpmisc)
+library(forecast)
+```
+## I. Introduction
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. The purpose of this study was to compare and contrast two distinct forecasting models to see if we could accurately predict new confirmed COVID cases in Tarrant County, Texas. The data set we will be working with comes courtesy of the Texas Department of State Health Services. It is publicly available and can be found at: 
+[\textcolor{blue}{Texas Department of State Health}](https://dshs.texas.gov/coronavirus/AdditionalData.aspx)
+
+```{r include=FALSE}
+temp=readr::read_csv("Tarrant NEWNEW.csv")
+temp=temp%>%mutate(date=mdy(date))
+covid=temp%>%as_tsibble(index=date)
+```
+
+## II. Condition of the Dataset
+Before we can proceed to our forecasting methods, there are a number of housekeeping issues we need to address. These issues include: (1) dealing with count data, (2) optimizing our sample size, (3) dealing with inconsistencies in data collection, & (4) transforming the data.
+
+### 1. Dealing with Count Data
+In statistics, count data is any observation that can only be counting numbers, i.e. non-negative integer values such as 0, 1, 2, 3, etc. Issues can arise when data contains small counts (anything <100), this would require us to use models with different distributional assumptions, which can become complicated rather quickly. Luckily (depending on how you look at it) the number of daily COVID cases in Texas are quite large, meaning it won't be necessary to employ these more complicated models. There are however, a couple of things we can do to improve the statistical power of our models. Which brings us to our next issue.
+
+### 2. Optimizing our Sample Size
+As previously discussed, small count numbers can prove to be detrimental to the estimates of our statistical models. The data set pulled from the Texas DSHS website begins its observations on March 4, 2020, which was the first presumptive case of COVID-19 in the state (Adams).
+```{r}
+autoplot(filter_index(covid,"2020-03-04"~"2020-04-15"),cases)+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+       title="Raw Data Plot From March 4th to April 15th")+
+  ylim(0,150)+stat_peaks(colour="red")+
+  stat_peaks(geom="text",colour="red",x.label.fmt="%D",span=7, hjust=1.2,
+             angle=320,ignore_threshold=0.1)
+```
+While March 4th is the beginning of our data set, we can see from the graph above that March 24th is when our data really starts accumulating. Because the first 20 observations are relatively close to zero, we can exclude them from the training set we'll be working with. We'll do this by creating a new object that filters out these unnecessary observations, naming it "covidOpt".
+```{r}
+covidOpt=covid%>%filter_index("2020-03-24"~"2021-11-09")
+```
+
+### 3. Dealing with Inconsistencies in Data Collection
+One issue that becomes aware to us when taking a glance at the full data set is that there appears to be zero cases reported throughout. This may be due to week-day effects, which we can further examine by creating a weekly subseries plot. 
+``` {r}
+covidOpt%>%gg_subseries(cases,period=7)
+```
+We can see from the sub-series plot that Sunday appears to have the lowest value mean, while Monday appears to have the highest. This coincides with our theory of week-day effects, just to be sure we can further investigate this with the estimation of weekday dummy variables. The following code uses a for-loop along with a sequence of if-conditionals to calculate weekday dummies. We can use these dummies to create a regression that will give us estimates for these weekday values.
+```{r}
+dayWEEK=covidOpt$date%>%wday()
+MON=rep(0,596)
+TUE=rep(0,596)
+WED=rep(0,596)
+THU=rep(0,596)
+FRI=rep(0,596)
+SAT=rep(0,596)
+SUN=rep(0,596)
+for (j in 1:596)
+{
+  if (dayWEEK[j]==1)
+    {SUN[j]=1}
+  else if (dayWEEK[j]==2)
+  {MON[j]=1}
+  else if (dayWEEK[j]==3)
+  {TUE[j]=1}
+  else if (dayWEEK[j]==4)
+  {WED[j]=1}
+  else if (dayWEEK[j]==5)
+  {THU[j]=1}
+  else if (dayWEEK[j]==6)
+  {FRI[j]=1}
+  else if (dayWEEK[j]==7)
+  {SAT[j]=1}
+}
+
+WeekdayEst=covidOpt%>%mutate(MON=MON,TUE=TUE,WED=WED,THU=THU,FRI=FRI,SAT=SAT,SUN=SUN)
+report(WeekdayEst%>%model(TSLM(cases~MON+TUE+WED+THU+FRI+SAT+SUN+0)))
+```
+This again confirms our hypothesis of error in our data collection, as Sunday is estimated to have the lowest COVID case counts, and Monday the highest. One way we can work around this is to employ a moving average in our training set. Here the term moving average takes a more literal definition, meaning that the averages move in a certain way within the data set. Mainstream statistics often employ this technique when presenting case counts to the public. We can do the same thing using a feature that averages a sequence of data points. 
+```{r}
+covidMA=covidOpt%>%mutate(MovingAverage=slider::slide_dbl(cases,mean,
+                              .before=3,.after=3,complete=TRUE))
+
+covidMA%>%pivot_longer(c(MovingAverage,cases),names_to="COVID Data")%>%
+  autoplot(value)+
+  labs(y="COVID CASES",x="Daily Observations",
+       title="Raw Case Count vs 7-day Centered Moving Average")
+```
+Finally we see just how impactful the inclusion of a moving average can be. In laymans terms, the blue 'Moving Average' plot is theoretically closer to the actual daily COVID cases after taking weekends and holidays; in which no cases were recorded due to data collectors not working those days, into account. Employing this moving average will theoretically make model selection much easier than if we were only working with the raw case count. However, for the sake of being thorough in our analysis we won't completely abandon the original variable known as 'cases'. Instead we'll perform all the steps of model selection on both the moving average we created and the raw case count. This brings us to our fourth and final housekeeping chore, dealing with stationarity.
+
+### 4. Transforming the Data
+A time series, $y_t$ is said to be covariance stationary if its mean and variance are constant and if its correlation with past observations, $y_{t-k}$, does not depend on time. Most analytic methods and models rely on stationarity in order to accurately predict patterns in the data. If the stationarity condition appears to be violated in our data, the most common resolution is to difference the series. There are several statistical tests we will employ to see if, and how, differencing our data would be beneficial. However, before we do this we'll take a look at a plot of the entire time-series to see if any transformations can be made to simplify the patterns in our data. This will only help us in the long run, making model selection much easier and hopeful producing more accurate forecasts.
+```{r}
+autoplot(covidMA,MovingAverage)+labs(x="Daily Observations",
+                              y="New Confirmed COVID Cases",
+                              title="Moving Average Plot of the Entire Time-Series")
+```
+Due to the huge changes in variability present in our data, it appears that a transformation of some sort would indeed be necessary. We can rule out a logarithmic transformation because even after employing moving averages, zeros are still present throughout our data and would only further complicate our results. A transformation we could do here would be a power transformation, specifically a square-root transformation using the box_cox feature within R. 
+```{r fig.show='hold', out.width='50%'}
+transformdata=covidMA%>%mutate(MAsqrt=box_cox(MovingAverage,0.5),
+                               RAWsqrt=box_cox(cases,0.5))
+transformdata%>%pivot_longer(c(MovingAverage,MAsqrt),names_to="COVID Data")%>%
+  autoplot(value)+labs(x="Daily Observations",y="New Confirmed COVID Cases",
+                       title="Original & Square Root Moving Average Plot")
+transformdata%>%pivot_longer(c(cases,RAWsqrt),names_to="COVID Data")%>%
+  autoplot(value)+labs(x="Daily Observations",y="New Confirmed COVID Cases",
+                       title="Original & Square Root of Raw Case Count Plot")
+```
+We plotted these graphs just to show the sharp contrast between the original values and their respected square-roots. One might ask, *"how will we be able to use the square-root values to create accurate forecasts?"* This is possible due to the back-transformation built into the box_cox() function. This makes our job much easier by automatically reverting any power/logarithmic changes made to an object. While it may appear that the square-root values look nothing like the original values, we can get a better look by plotting them by themselves.
+```{r fig.show='hold', out.width='50%'}
+autoplot(transformdata,value)+aes(x=date,y=MAsqrt)+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+                              title="Square Root of Moving Average Plot")
+autoplot(transformdata,value)+aes(x=date,y=RAWsqrt)+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+                              title="Square Root of Raw Case Count Plot")
+```
+These time-series would require us to transform our forecasting results, but appears to fix the problems we had with volatility. We'll now edit our data set to exclude the last 7 observations in order to create a training set that we'll use for forecasting. After which we can continue with our other tests, the first being a unit-root test known as the "Kwiatkowski-Phillips-Schmidt-Shin test", KPSS test for short. We might first check to see if a seasonal unit root is present using the unitroot\_nsdiffs procedure within R.\footnote{Formally, this procedure uses an STL decomposition method to extract seasonal, trend, and cyclical variation. Seasonal differencing is recommended when seasonal variation accounts for at least 64\% of the overall variation of the data. See R documentation for 'unitroot\_nsdiffs' for more detail.} 
+```{r echo=FALSE, warning=FALSE}
+#forecast horizon of 7 days 2021-11-09
+FinalTrainingSet=transformdata%>%filter_index("2020-03-24"~"2021-11-02")
+FinalTrainingSet%>%features(MAsqrt,unitroot_nsdiffs)
+FinalTrainingSet%>%features(RAWsqrt,unitroot_nsdiffs)
+```
+The tests indicate that a seasonal difference will not be necessary for both of our variables, which makes sense given that there is only about one years worth of data to check. To examine if non-seasonal differencing is necessary for our training set, we run two KPSS tests, applied to our transformed series and its first difference.
+```{r}
+FinalTrainingSet%>%features(MAsqrt,unitroot_kpss)
+FinalTrainingSet%>%features(difference(MAsqrt),unitroot_kpss)
+
+FinalTrainingSet%>%features(RAWsqrt,unitroot_kpss)
+FinalTrainingSet%>%features(difference(RAWsqrt),unitroot_kpss)
+```
+The null hypothesis ($H_0$) of the KPSS test is that the data is trend-stationary, therefore not requiring differencing. Here, R initially provides a p-value code of 0.01 for both our 'MAsqrt' and 'RAWsqrt' variables, indicating that p-value for our test is less than 0.01, implying a rejection of the stationary null. For the subsequent tests on both variables, our p-value is in excess of 0.10, implying that after differencing, we no longer reject that the data is stationary. The KPSS test provides evidence that we should set $d=1$. 
+
+Now we will run a separate unit-root test known as the 'Augmented Dickey-Fuller' test (ADF) only on the MAsqrt variable first. This test is less complicated than the KPSS test and can be used to confirm our previous results. Here the null hypothesis is that a unit-root is present in the data, the opposite hypothesis of the KPSS test.
+```{r}
+MAsqrtTS=as.ts(FinalTrainingSet,MAsqrt)
+ur.df(MAsqrtTS,type="drift",lags=50,selectlags="AIC")
+```
+In this first run, we use a 5\% test-size and allow up to 50 lags, allowing R to select the optimal number of lags based on the Akaike Information Criterion. To conserve space, the full output is not displayed, but the test chooses 23 lags. We can compare the test-statistic, -2.2423 with the $\tau_2$ critical, given by -2.86. The null hypothesis is based on a t-statistic with a one-sided alternative, where rejection only occurs if the test statistic is less than our critical value. Here, with -2.2423>-2.86, we fail to reject the null, and evidence suggests that a unit root may be present in our data. This confirms the same result we got from the KPSS test. We'll now run the test again with the data differenced.
+```{r}
+ur.df(diff(MAsqrtTS),type="none",lags=50,selectlags="AIC")
+```
+In this case, our test-statistic has a slightly different distribution, given the exclusion of a drift term. We therefore compare our test-statistic to the $\tau_1$ critical values that are available from a full summary of the test. Here our test-statistic < critical-value (-3.8911<-1.95), meaning we reject the H0. This along with the result of the KPSS tests confirms that our data indeed benefits from being differenced. We can conclude that $d=1$ for our 'MAsqrt' variable for any models that require a non-seasonal differencing value. We'll now repeat these steps for our 'RAWsqrt' variable.
+```{r}
+RAWsqrtTS=as.ts(FinalTrainingSet,RAWsqrt)
+ur.df(RAWsqrtTS,type="drift",lags=50,selectlags="AIC")
+```
+Here the test chooses 29 lags and we can compare the test-statistic, -2.0964 with the $\tau_2$ critical, -2.86. With -2.0964>-2.86, we again fail to reject the null, and will run the test again with the data differenced.
+```{r}
+ur.df(diff(RAWsqrtTS),type="none",lags=50,selectlags="AIC")
+```
+Again we compare our test-statistic to the $\tau_1$ critical value. Here our test-statistic < critical-value (-4.5323<-1.95), meaning we reject the H0. This along with the result of the KPSS tests confirms that our data indeed benefits from being differenced. We can conclude that $d=1$ for our 'RAWsqrt' variable for any models that require a non-seasonal differencing value and we can proceed to model selection.
+
+##  III. First Model: Seasonal AutoRegressive Intergrated Moving Average (SARIMA)
+ARIMA models are made up of equations that account for auto-regression (AR), moving-average (MA), and differencing. Seasonal ARIMA models (SARIMA for short) include all of these components twice, once for seasonality and once for non-seasonality. We have already concluded that the degree of first differencing involved for our non-seasonal component for both variables is one (d=1), and zero for the seasonal component (D=0). We'll now use auto-correlations and partial auto-correlation graphs to estimate the order of auto-regressive parts (p & P) and the order of the moving average parts (q & Q), starting with our MAsqrt variable.
+
+### Estimating a SARIMA Model for the 7-Day Moving Average
+```{r warning=FALSE}
+FinalTrainingSet%>%gg_tsdisplay(difference(MAsqrt),plot_type="partial",
+                                lag_max=45)
+```
+These are the auto-correlations (acf) and partial auto-correlations (pacf) of the first differenced (d=1) square root values, of our 7 day moving average COVID data in Tarrant County. The first thing that pops out right away are the exponentially decaying seasonal lags in the PACF, which are complemented by a single significant spike at the 7th lag in the ACF. This is usually characteristic of a seasonal MA part equal to 1 (Q=1). However, the first seasonal lag in the PACF appears to be more significant than its counter-part in the ACF. This could mean that the auto-regressive pieces are dominant, and that we should also test a model with 3 seasonal AR pieces (P=3). We say 3 AR pieces because the last significant seasonal lag occurs at lag 21, and our seasonal period is in weeks (7 days). As for any non-seasonal implications, we don't see much in either plot besides significant spikes in their first lag. We do see significant positive spikes all the way up to lag 10 of the PACF so maybe we'll try adjusting for additional AR components. For now we proceed with an initial guess of SARIMA(1,1,1)x(0,0,1) along with some other guesses to see which give is the best AIC, BIC & AICc scores. 
+```{r}
+fit=FinalTrainingSet%>%model(
+  initialguess=ARIMA(MAsqrt~0+pdq(1,1,1)+PDQ(0,0,1)),
+  sAR_1=ARIMA(MAsqrt~0+pdq(1,1,1)+PDQ(1,0,0)),
+  sAR1_AR6=ARIMA(MAsqrt~0+pdq(6,1,1)+PDQ(1,0,0)),
+  sAR_3=ARIMA(MAsqrt~0+pdq(1,1,1)+PDQ(3,0,0)),
+  sAR3_sMA1=ARIMA(MAsqrt~0+pdq(1,1,1)+PDQ(3,0,1)),
+  sMA1_sAR1=ARIMA(MAsqrt~0+pdq(1,1,1)+PDQ(1,0,1)),
+  guessauto=ARIMA(MAsqrt))
+glance(fit)
+```
+It appears that our initial guess does not give us the lowest AICc score, instead the model generated by the program labeled "guessauto" gives us a very slightly smaller score. This goes to show the importance of not neglecting available resources, as some data scientists ignore auto-generated models. We'll opt for the candidate model being a SARIMA(2,1,3)x(0,0,1), generated by the program, and proceed to run a Ljung-Box test to see if there is any serial correlation still present in our model. If there is not, our selected model has absorbed necessary, and we can proceed to forecast with it. 
+```{r echo=FALSE}
+candidateMAmodel=FinalTrainingSet%>%model(ARIMA(box_cox(MovingAverage,0.5)~0+pdq(2,1,3)+PDQ(0,0,1)))
+candidateMAmodel%>%gg_tsresiduals(lag=45)
+```
+The Ljung-Box test allows us to ask if the first *m* auto-correlation coefficients are jointly zero (the last condition of stationarity), where *m* is a value we can select. Looking at the plot of our residuals, it appears that there still might be serial correlation present in our data. We can further examine this by running a formal test.
+```{r}
+augment(candidateMAmodel)%>%features(.innov,ljung_box,lag=30,dof=6)
+qchisq(.95,24)
+```
+The null hypothesis ($H_0$) of the Ljung-Box test is that the first *m* auto-correlations are jointly zero, meaning that the model in question has achieved stationarity by eating up any serial correlation present in its residuals. A test-statistic<critical-value confirms the $H_0$, and we can proceed to forecast with our appropriate model. Here we compare the $\chi^2$ test statistic, 43.67 to a 95\% $\chi^2$ critical value with 24 degrees of freedom, 36.41503. Since 43.67>36.41503 we reject the $H_0$, evidence suggests serial correlation may still be present in our data. We'll have to go back to model selection to fine-tune our model. 
+```{r}
+fitv2=FinalTrainingSet%>%model(
+  initialcandidate=ARIMA(MAsqrt~0+pdq(5,1,3)+PDQ(0,0,1)),
+  AR4_MA4=ARIMA(MAsqrt~0+pdq(4,1,4)+PDQ(0,0,1)),
+  AR5_MA6=ARIMA(MAsqrt~0+pdq(5,1,6)+PDQ(0,0,1)))
+glance(fitv2)
+```
+
+```{r}
+candidateMAmodelv2=FinalTrainingSet%>%model(ARIMA(box_cox(MovingAverage,0.5)~0+pdq(5,1,6)+PDQ(0,0,1)))
+candidateMAmodelv2%>%gg_tsresiduals(lag=60)
+augment(candidateMAmodelv2)%>%features(.innov,ljung_box,lag=60,dof=12)
+qchisq(.95,48)
+```
+Finding an appropriate model took meticulous testing in model selection, which is to be expected when dealing with daily count data.\footnote{We will expand on this issue in particular later in the paper as its discussion has to do with our other model we will be estimating} Any time series recording days or weeks are notoriously difficult to model using ARIMA methods due to the amount of serial correlation that comes with short time intervals. Here we came to find that a SARIMA(5,1,6)x(0,0,1) is the most appropriate for our MAsqrt variable. With this model, we fail to reject the $H_0$ that the first *60* auto-correlation coefficients are jointly zero and can proceed to forecast with our appropriate model.
+
+### Estimating a SARIMA Model for Raw Case Counts
+```{r warning=FALSE}
+FinalTrainingSet%>%gg_tsdisplay(difference(RAWsqrt),plot_type="partial",
+                                lag_max=45)
+```
+Similar to how we did model selection for the MAsqrt variable, we'll now perform the same analysis for RAWsqrt variable. Again we seasonal lags but this time they seem to a more complex decay in the ACF. Similar to the moving average plot, we see major significant spikes in the first lags of both plots. The only other key difference here is that the first *6* lags of the PACF appear to be statistically significant. I believe a good starting candidate model could be a SARIMA(1,1,1)x(2,0,0) model, seeing as we could manipulate the AR pieces and seasonal MA pieces if need be. We'll now estimate our inital guess along with other models to compare the accuracy statistics.
+```{r}
+fit1=FinalTrainingSet%>%model(
+  initialguess=ARIMA(RAWsqrt~0+pdq(1,1,1)+PDQ(2,0,0)),
+  sMA_2=ARIMA(RAWsqrt~0+pdq(1,1,1)+PDQ(0,0,2)),
+  sMA4_AR6=ARIMA(RAWsqrt~0+pdq(6,1,1)+PDQ(0,0,4)),
+  sAR1_sMA4=ARIMA(RAWsqrt~0+pdq(1,1,1)+PDQ(1,0,4)),
+  sMA1=ARIMA(RAWsqrt~0+pdq(1,1,1)+PDQ(0,0,1)),
+  guessauto=ARIMA(RAWsqrt))
+glance(fit1)
+```
+After examining the accuracy scores, it appears that the model labeled 'sAR1_sMA4' yields the smallest AICc value. We'll choose this as our candidate model and proceed with a Ljung-Box Test. 
+```{r}
+candidateRAWmodel=FinalTrainingSet%>%model(ARIMA(box_cox(cases,0.5)~0+pdq(1,1,1)+PDQ(1,0,4)))
+candidateRAWmodel%>%gg_tsresiduals(lag=45)
+augment(candidateRAWmodel)%>%features(.innov,ljung_box,lag=30,dof=7)
+qchisq(.95,23)
+```
+Looking at the residual plot, it appears as though we have chosen an appropriate model, with only about 1 lag being statistically significant. Of course, we will need to further examine this with a formal test. One or two lags outside of the significance bands isn't always problematic, especially if they occur much later from the start of the time-series.
+
+Running a formal Ljung-Box test gives us a $\chi^2$ test statistic of 27.61249, which we can compare to a 95\% $\chi^2$ critical value with 23 degrees of freedom equal to 35.17246. Since 27.61<35.17 we fail to reject the $H_0$ that the first *30* lags are jointly zero, deeming our model stationary and appropriate for forecasting. We'll now save both of our models as 'Final Models' and proceed to forecast with them.
+```{r}
+finalSARIMAmovingaverage=candidateMAmodelv2
+finalSARIMAcases=candidateRAWmodel
+```
+
+### Forecasting with Our Final SARIMA Models
+We will now plot all of our models, once regressing the model on the raw case count data and once regressing the model on the moving average of case count data. We'll begin by creating plots forecasting a 7 step-ahead horizon using the values from our training set. We'll then layer in the actual observed values for confirmed COVID cases in Tarrant County. Separately, we include the forecast results based on the 7-day moving average we created. The forecast horizon will begin on November 3rd, 2021 and go through November 9th 2021.
+```{r echo=FALSE, fig.show='hold', out.width='50%'}
+finalSARIMAcases%>%forecast(h=7)%>%
+  autoplot(filter_index(covidMA,"2021-10-21"~"2021-11-09"),colour="purple")+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+                       title="SARIMA Model Prediction Regressing Raw Data")+
+  theme(legend.position="bottom")
+
+finalSARIMAmovingaverage%>%forecast(h=7)%>%
+  autoplot(filter_index(covidMA,"2021-10-21"~"2021-11-09"),colour="purple")+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+       title="SARIMA Model Prediction Regressing MA")+
+  theme(legend.position="bottom")
+```
+From the looks of these graphs it appears as though our model made some fair estimates, nailing all of our moving average values within the 80% confidence bands and almost all of the raw case count values within the 80% bands. To take a closer look at the numerical estimates, we can coerce the model estimates into a data frame. We'll do this along with the actual observed values and the moving average values, and use the 'Root Mean Squared Error (RMSE)' statistic to get a better sense of how accurate the prediction is.
+
+```{r echo=FALSE, warning=FALSE,}
+print('Actual Observed Case Counts & Moving Average vs Predicted Values')
+SARIMAma=finalSARIMAmovingaverage%>%forecast(h=7)
+SARIMAraw=finalSARIMAcases%>%forecast(h=7)
+actualCASES=(filter_index(covidMA,"2021-11-03" ~ "2021-11-09"))%>%as.data.frame()
+actualCASES%>%mutate(SARIMAma=SARIMAma$.mean,SARIMAraw=SARIMAraw$.mean)
+print('Accuracy of SARIMA Model Regressing Moving Average Values')
+SARIMAma%>%accuracy(covidMA)%>%as.data.frame()
+print('Accuracy of SARIMA Model Regressing Raw Case Counts')
+SARIMAraw%>%accuracy(covidMA)%>%as.data.frame()
+
+```
+Generally speaking, the RMSE implies that on average, the error of our moving average model is only about 20.4 cases away from the moving average while the error of our raw case count model is 133.8 respectfully. These are fairly small margins given that daily COVID cases in Tarrant County range from zero to several thousand. This SARIMA model was indeed accurate but before we forecast unknown future values, we're going to create another model. 
+
+## IV. Second Model: Single-Layer Feed-Forward  Auto-Regressive Neural Network 
+Our second model choice will be a feed-forward single-layer auto-regressive neural network. This model uses machine learning as opposed to just data analysis, and is called a neural network due to the way that it is modeled, similar to the human brain.
+
+### What is a Neural Network?
+A neural network is a machine learning technique that feeds input values also known as "predictor values" or "weights" through a network of nodes. It then obtains forecasts from a combination of these inputs. The neural network begins by assigning random values to these weights and sets parameters using a "learning algorithm", repeating the entire process equal to the number of networks specified. We are specifically using a single-layer feed-forward network, meaning that it only feeds the inputs unilaterally through a single hidden layer in the network. 
+
+### Estimating a Baseline Linear Model
+The estimation of the SARIMA models greatly benefits us here, because we already estimated non-seasonal and seasonal auto-regressive pieces (p & P). The only changes we will have to make will be accounting for the first-differencing and any moving average pieces we might have estimated. Luckily we can easily work around this by adding 1 to our estimated value of *p* for each differencing, and 1 to our estimated value of *P* for each seasonal moving average piece in both cases. Moving average components, and especially seasonal moving average components, can severely affect the accuracy of a neural network. Recall that the final model we estimated in the case of the *SARIMAma* model was a *SARIMA(5,1,6)x(0,0,1)*, that would mean that for a neural network  *p = 5 + 1 + 6 = 12*. As for the *SARIMAraw* model, we estimated *SARIMA(1,1,1)x(1,0,4)* meaning that for estimating a neural network, *p = 1 + 1 + 1 = 3* and *P = 1 + 4 = 5*. 
+
+### Using Dynamic Harmonic Regression (DHR) for Different Types of Seasonality
+SARIMA methods are best applied to data with only one type of well defined seasonality, this is because the ARIMA function in R runs out of memory when seasonal periods are greater than 200. Luckily we can use Fourier terms through dynamic harmonic regression to capture any seasonality that the neural network cannot. Fourier terms replicate patterns in a time series by osculating different values of sine and cosine, the more Fourier terms included (*k*), the more statistically powerful the forecast becomes. Lets begin by taking another look at the moving average plot, specifically an entire year beginning and ending on June 20th, the first day of summer. We will analyze only the moving average because trends of the entire time series will be easier to identify using the transformed moving average plot, and the results we draw from it will apply to both the moving average and the raw case count.
+```{r}
+autoplot(filter_index(covidMA,"2020-06-20"~"2021-06-20"),value)+
+  aes(y=MovingAverage,x=date)+
+  ylim(0,3000)+stat_peaks(colour="red")+
+  stat_peaks(geom="text",colour="red",x.label.fmt="%D",span=15, hjust=1.2,
+             angle=270,ignore_threshold=0.1)+
+  labs(y="New COVID Cases",x="Daily Moving Average",
+       title="Moving Average Plot with 15 Day Peak Spans")
+```
+Looking at this plot we can see that the data starts from what appears to be an increasing position towards the end of the second quarter. From there it appears to hold steady for a while then drops at the end of the third quarter. Finally this fourth and final quarter of 2020 is where we see a dramatic increase in cases, setting the upper bounds of our graph. The beginning of 2021 sees an exponential decay in cases, where we don't see any more peaks until the very end of our data, which would be the beginning of Q3. There isn't a whole lot to dissect here as we don't have a lot of historical data to analyze, but we can draw a couple hypotheses.(1) It's possible that COVID transmission has some quarterly implications due to the valleys that occur towards the end/beginning of quarters. (2) It's also possible that semi-annual implications may be present seeing as cases begin increasing in July and continue through the rest of the year.
+
+Why this is happening we have no idea, it could be due to a number of things. One hypothesis could be that the virus mutates on a specific timeline of roughly half a year, creating this exponential growth in cases that we see. It's also possible that the virus becomes more easily transmissible as the seasons change. This coincide with Q4 seeing the highest case counts, as people tend to stay indoors for holidays and cooler weather which benefits this airborne virus. Regardless of the reasons that the data is behaving this way, we can use this analysis to select periods for our fourier terms.
+
+### Estimating the Appropriate Fourier Terms for the 7-Day Moving Average
+We'll begin estimating the appropriate fourier terms and periods by running multiple regressions with different seasonal periods and terms. The reason we're doing this and not just including all periods into one model is because including too many terms would likely over-fit the model. Overfitting occurs when a model is overly dependent on a data set and is far too accurate for any implications outside of the data in question. 
+
+An example of a different context could be vaccines. Creating a vaccine that builds anti-bodies for the Omicron variant of COVID-19 would be an example of over-fitting the gene-therapy. By only targeting one specific variant of a constantly mutating virus, the vaccine would be far less effective in preventing the transmission of COVID-19 because it's *too* specific.
+```{r warning=FALSE, echo=FALSE}
+fit2=FinalTrainingSet%>%model(
+  period7=ARIMA(box_cox(MovingAverage,0.5)~0+pdq(5,1,6)+PDQ(0,0,1)+
+                         fourier(period=7,K=3)),
+  period30=ARIMA(box_cox(MovingAverage,0.5)~0+pdq(5,1,6)+PDQ(0,0,1)+
+                          fourier(period=30,K=6)),
+    period90=ARIMA(box_cox(MovingAverage,0.5)~0+pdq(5,1,6)+PDQ(0,0,1)+
+                       fourier(period=90,K=6)),
+  period180=ARIMA(box_cox(MovingAverage,0.5)~0+pdq(5,1,6)+PDQ(0,0,1)+
+                          fourier(period=180,K=6)),
+    period7_30=ARIMA(box_cox(MovingAverage,0.5)~0+pdq(5,1,6)+PDQ(0,0,1)+
+                       fourier(period=7,K=3)+fourier(period=30,K=6)),
+     period30_90=ARIMA(box_cox(MovingAverage,0.5)~0+pdq(5,1,6)+PDQ(0,0,1)+
+                       fourier(period=30,K=4)+fourier(period=90,K=6)),
+  period90_180=ARIMA(box_cox(MovingAverage,0.5)~0+pdq(5,1,6)+PDQ(0,0,1)+
+                          fourier(period=90,K=4)+fourier(period=180,K=6)),
+    periodALL=ARIMA(box_cox(MovingAverage,0.5)~0+pdq(5,1,6)+PDQ(0,0,1)+
+                       fourier(period=7,K=2)+fourier(period=30,K=4)+
+                         fourier(period=90,K=6)+fourier(period=180,K=8)))
+glance(fit2)
+```
+After running an initial report on all of these models, it appears that including too many periods here is only negatively affecting our scores. We can see that the model with only a 7 day seasonal fourier period gave us the smallest statistical AICc score, meaning that the optimal number of fourier terms to include in our neural network will be 3 with 7 day periods. We will now proceed to estimate a candidate neural network.
+
+### Estimating Our Moving Average Neural Network
+for our first attempt of a neural network we'll use the AR values estimated earlier (P=0 & p=12) based on the SARIMA model done before. We will set the networks of this first attempt to 50 as it seems like an appropriate amount for our first iteration, after all we could always increase the number of networks. While doing so would increase the statistical power of our model, it also requires a lot of computational power and it may take a lot longer to see any results.
+```{r}
+NeuralNet1=FinalTrainingSet%>%model(NNETAR(box_cox(MovingAverage,0.5)~AR(P=0,p=12)+
+                                             fourier(period=7,K=3),n_networks=50))
+report(NeuralNet1)
+```
+This is a relatively strong network, complete with 201 weights over 50 networks. Just to see how these results can vary, we'll run three more networks. One will be the exact same model but with 100 networks, One will be the same model with less Fourier terms, and we'll let R select the last model, only specifying the number of fourier terms and setting networks to 50.
+``` {r echo=FALSE}
+report(NeuralNet1)
+NeuralNet2=FinalTrainingSet%>%model(NNETAR(box_cox(MovingAverage,0.5)~AR(P=0,p=12)+
+                                             fourier(period=7,K=3),n_networks=100))
+report(NeuralNet2)
+
+NeuralNet3=FinalTrainingSet%>%model(NNETAR(box_cox(MovingAverage,0.5)~AR(P=0,p=12)+
+                                             fourier(period=7,K=2),n_networks=100))
+report(NeuralNet3)
+
+NeuralNet4=FinalTrainingSet%>%model(NNETAR(box_cox(MovingAverage,0.5)~fourier(K=3),n_networks=50))
+report(NeuralNet4)
+```
+These results showcase the power of machine learning. Unlike with SARIMA model selection, the auto-generated model here is actually far more accurate than the data scientists selected models. We can see that the only network that decreased in size was the one with less fourier terms. The model called "NeuralNet3" took a little longer to process with 100 networks, but we can see that the in-sample forecast error variance (sigma^2) slightly increased. This is because each additional network gives the program another chance to run a different path, thus increasing the variability in our sample. By not setting either of the AR values in the final model we let R select their values by the lowest associated AIC score, giving us a *NNAR(22,1,14)* meaning the program set *p=22 & P=1*. This gives us a much more powerful network, without having to include additional fourier terms. We'll select the model named "NeuralNet4" as our final neural net model and proceed to model selection of the raw case count data.
+
+### Estimating a Raw Case Count Neural Network
+As we did with the Moving Average, we'll start by estimating the appropriate number of fourier terms.
+```{r warning=FALSE, echo=FALSE}
+fit2v2=FinalTrainingSet%>%model(
+  period7=ARIMA(box_cox(cases,0.5)~0+pdq(1,1,1)+PDQ(1,0,4)+
+                         fourier(period=7,K=3)),
+  period30=ARIMA(box_cox(cases,0.5)~0+pdq(1,1,1)+PDQ(1,0,4)+
+                          fourier(period=30,K=6)),
+    period90=ARIMA(box_cox(cases,0.5)~0+pdq(1,1,1)+PDQ(1,0,4)+
+                       fourier(period=90,K=6)),
+  period180=ARIMA(box_cox(cases,0.5)~0+pdq(1,1,1)+PDQ(1,0,4)+
+                          fourier(period=180,K=6)),
+    period7_30=ARIMA(box_cox(cases,0.5)~0+pdq(1,1,1)+PDQ(1,0,4)+
+                       fourier(period=7,K=3)+fourier(period=30,K=6)),
+     period30_90=ARIMA(box_cox(cases,0.5)~0+pdq(1,1,1)+PDQ(1,0,4)+
+                       fourier(period=30,K=4)+fourier(period=90,K=6)),
+  period90_180=ARIMA(box_cox(cases,0.5)~0+pdq(1,1,1)+PDQ(1,0,4)+
+                          fourier(period=90,K=4)+fourier(period=180,K=6)),
+    periodALL=ARIMA(box_cox(cases,0.5)~0+pdq(1,1,1)+PDQ(1,0,4)+
+                       fourier(period=7,K=2)+fourier(period=30,K=4)+
+                         fourier(period=90,K=6)+fourier(period=180,K=8)))
+glance(fit2v2)
+```
+Once again we see that the lowest associated AICc score comes from the model with a period of 7 days, we will keep this value and run the same 4 NNETAR model as we did with the moving average.
+```{r echo=FALSE}
+NeuralNet1v2=FinalTrainingSet%>%model(NNETAR(box_cox(cases,0.5)~AR(P=5,p=3)+
+                                             fourier(period=7,K=3),n_networks=50))
+report(NeuralNet1v2)
+
+NeuralNet2v2=FinalTrainingSet%>%model(NNETAR(box_cox(cases,0.5)~AR(P=5,p=3)+
+                                             fourier(period=7,K=3),n_networks=100))
+report(NeuralNet2v2)
+
+NeuralNet3v2=FinalTrainingSet%>%model(NNETAR(box_cox(cases,0.5)~AR(P=5,p=3)+
+                                             fourier(period=7,K=2),n_networks=100))
+report(NeuralNet3v2)
+
+NeuralNet4v2=FinalTrainingSet%>%model(NNETAR(box_cox(cases,0.5)~fourier(K=3),n_networks=50))
+report(NeuralNet4v2)
+```
+Again we see the auto generated model vastly outperforming the data scientists selected models, creating a large 466 weight *NNETAR(23,1,15)* model where *p=23 & P=1*. we'll save this as our final NNETAR model for raw case counts and proceed to forecasting.
+
+### Forecasting with our Final Neural Network Models
+```{r echo=FALSE, cache=TRUE, out.width='50%', fig.show='hold'}
+NNETARma=NeuralNet4
+NNETARraw=NeuralNet4v2
+
+NNETARma%>%forecast(h=7,times=100)%>%
+  autoplot(filter_index(covidMA,"2021-10-21"~"2021-11-09"),colour="purple")+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+                       title="NNETAR Model Prediction Regressing MA")+
+  theme(legend.position="bottom")
+
+NNETARraw%>%forecast(h=7,times=100)%>%
+  autoplot(filter_index(covidMA,"2021-10-21"~"2021-11-09"),colour="purple")+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+                       title="NNETAR Model Prediction Regressing Raw Case Data")+
+  theme(legend.position="bottom")
+```
+Like our SARIMA models done before we see some fairly accurate results. Since a neural network is not based on a single well defined stochastic model, it can be difficult to interpret prediction intervals (confidence intervals) from a single forecast. One way to get a better idea of potential paths and values from a NN model would be to generate simulated paths, this is essentially the same way R generates a forecast (all other forecast done before). The generation of simulated paths can be plotted graphically, but is outside the scope of this project. What we did do here that is different is set *times* of our forecasts equal to 100, as opposed to the default 1000. We did this to generate results quicker since forecasts with our particular models wont benefit much from the default forecast generations of 1000. To take a closer look at the numerical estimates we'll coerce the model estimates into a data frame. We'll do this along with the actual observed values and the moving average values, and use the 'Root Mean Squared Error (RMSE)' statistic to get a better sense of how accurate the prediction is.
+```{r echo=FALSE, warning=FALSE, cache=TRUE}
+print('Actual Observed Case Count & Moving Average vs Predicted Values')
+NNETARma=NNETARma%>%forecast(h=7,times=100)
+NNETARraw=NNETARraw%>%forecast(h=7,times=100)
+actualCASES2=(filter_index(covidMA,"2021-11-03" ~ "2021-11-09"))%>%as.data.frame()
+actualCASES2%>%mutate(NNETARma=NNETARma$.mean,NNETARraw=NNETARraw$.mean)
+print('Accuracy of Neural Network Regressing Moving Average Values')
+NNETARma%>%accuracy(covidMA)%>%as.data.frame()
+print('Accuracy of Neural Network Regressing Raw Case Counts')
+NNETARraw%>%accuracy(covidMA)%>%as.data.frame()
+
+```
+Here we see that the error of our moving average neural network is about 58 cases away from the observed moving average while the error of our raw case count model is 179.6 cases. Again, these are fairly accurate estimates for a relatively simple neural network. Now that we've created two distinct models, we can proceed to future forecasting.
+
+## V. Choosing a Final Model for Future Forecasting
+Both of the models created come from completely different statistical methodologies, the pros and cons of which we'll explore in a moment. To start lets create two new plots, one will contain the observed values along with the predicted values of each model using the raw case count, and the other containing the predicted values using the moving average.
+```{r echo=FALSE, fig.align='left', cache=TRUE, out.height='40%'}
+maMODELS=FinalTrainingSet%>%
+  model('SARIMAma'=ARIMA(box_cox(MovingAverage,0.5)~0+pdq(5,1,6)+PDQ(0,0,1)),
+        'NNETARma'=NNETAR(box_cox(MovingAverage,0.5)~fourier(K=3),n_networks=50))
+
+rawMODELS=FinalTrainingSet%>%
+  model('SARIMAraw'=ARIMA(box_cox(cases,0.5)~0+pdq(1,1,1)+PDQ(1,0,4)),
+        'NNETARraw'=NNETAR(box_cox(cases,0.5)~fourier(K=3),n_networks=50))
+
+rawMODELS%>%forecast(h=7,times=100)%>%
+  autoplot(filter_index(covidMA,"2021-10-21"~"2021-11-09"),level=NULL)+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+       title="SARIMA & NNETAR Model Prediction Regressing Raw Case Data")+
+  guides(colour=guide_legend(title="METHOD"))+
+  theme(legend.position="bottom")
+
+maMODELS%>%forecast(h=7,times=100)%>%
+  autoplot(filter_index(covidMA,"2021-10-21"~"2021-11-09"),level=NULL)+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+       title="SARIMA & NNETAR Model Prediction Regressing Moving Average")+
+  guides(colour=guide_legend(title="METHOD"))+
+  theme(legend.position="bottom")
+```
+These plots really speak volumes when we include both models. We can see that in both cases the SARIMA model appears to have the superior fit. Once again as we've done in the past, we'll create totally new data sets to compare the predicted values of both models using their respected data sets. We'll also bring back the RMSE statistics done previously to easily compare the two.
+```{r echo=FALSE, warning=FALSE}
+actualCASES3=(filter_index(covidMA,"2021-11-03" ~ "2021-11-09"))%>%as.data.frame()
+print('Actual Observed Raw Case Count vs Predicted Values of Both Models')
+actualCASES3%>%mutate(SARIMAraw=SARIMAraw$.mean,NNETARraw=NNETARraw$.mean)
+print('Accuracy of SARIMA Model Regressing Raw Case Counts')
+SARIMAraw%>%accuracy(covidMA)%>%as.data.frame()
+print('Accuracy of Neural Network Regressing Raw Case Counts')
+NNETARraw%>%accuracy(covidMA)%>%as.data.frame()
+actualCASES4=(filter_index(covidMA,"2021-11-03" ~ "2021-11-09"))%>%as.data.frame()
+print('Actual Observed Moving Average vs Predicted Values of Both Models')
+actualCASES4%>%mutate(SARIMAma=SARIMAma$.mean,NNETARma=NNETARma$.mean)
+print('Accuracy of SARIMA Model Regressing Moving Average Values')
+SARIMAma%>%accuracy(covidMA)%>%as.data.frame()
+print('Accuracy of Neural Network Regressing Moving Average Values')
+NNETARma%>%accuracy(covidMA)%>%as.data.frame()
+
+```
+We can see that in both cases the RMSE of the SARIMA model is smaller than that of its neural network counter-part. After taking these plots and tables into consideration, we conclude that the SARIMA model provides a superior fit. One might ask "*how is it that an advanced machine-learning algorithm cannot produce better results than legacy statistical models?*", which is a fair question. The neural network was less accurate for a couple of reasons. The first being probably the most important, that this type of network does not account for seasonality in a way that benefits this data. Upon completion of the model selection process of the SARIMA model, it became evident that the auto-correlation coefficients had at least one non-seasonal MA part. As stated previously, the AR neural network can become complicated when MA's are present in the data, which brings us to the second reason. 
+
+We could have tried to deal with the presence of a MA piece by increasing the fourier terms or trying different periods. The problem with this is that it would have required even more computational power, which is sub-optimal as each forecast with the current neural networks took several minutes to complete. On top of this, a larger network would have likely led to over-fitting, making all of our additional effort utterly useless. DHR is most useful when there are clearer patterns of seasonality like with internet traffic. In our case, COVID data is still in its infancy and the patterns of transmission are largely still unknown.
+
+## VI. Forecasting Unknown Future Values with Our Final Model
+Now that we have selected a final model to forecast with, we'll create a final model using the full data set we called "covidMA" and use it to forecast future unknown values. We'll plot a 14-step ahead horizon beginning on November 10th, 2021, just to see the weekday effects. Thanks to the 7 day moving average that we created, we can include a moving average plot in our graph that theoretically would be closer to the actual daily case count after factoring in weekends and holidays.
+```{r warning=FALSE, message=FALSE, cache=TRUE}
+finalMODELma=covidMA%>%model('SARIMA'=
+                               ARIMA(box_cox(MovingAverage,0.5)~0+pdq(5,1,6)+PDQ(0,0,1)))
+finalMODELma=finalMODELma%>%forecast(h=14)%>%as_tsibble()
+finalMODELraw=covidMA%>%model('SARIMA'=
+                                ARIMA(box_cox(cases,0.5)~0+pdq(1,1,1)+PDQ(1,0,4)))
+finalMODELraw=finalMODELraw%>%forecast(h=14)%>%as_tsibble()
+
+FINALMODEL=bind_cols(finalMODELma,finalMODELraw)%>%rename(MA=.mean...4,RAW=.mean...8)
+last_plot2=covidMA%>%filter_index("2021-10-01"~"2021-11-09")
+
+FINALMODEL%>%pivot_longer(c(4,8),names_to="COVID Projections")%>%
+  autoplot(value)+autolayer(last_plot2)+
+  labs(x="Daily Observations",y="New Confirmed COVID Cases",
+       title="SARIMA Model Prediction of Raw Case Count & 7 Day Moving Average")+
+  guides(colour=guide_legend(title="METHOD"))+theme(legend.position="bottom")
+```
+Finally, we can get a better idea for these values by creating data frames.
+```{r echo=FALSE}
+print('Estimated Future Raw Case Count Values')
+FINALMODEL%>%as.data.frame()%>%dplyr::select(6,8)
+print('Estimated Future Moving Average Values')
+FINALMODEL%>%as.data.frame()%>%dplyr::select(2,4)
+```
+Future studies can think of other ways to tackle the issues of data collection. Other possible options that could have been implemented include employing dummy variables, or aggregating weekend data counts and only working on reporting days Monday-Friday. While those are both good options, its safe to say that implementing them would be outside of the scope of this study.
+
+## Sources Cited
+https://www.kxan.com/news/coronavirus/365-days-of-covid-how-the-coronavirus-in-texas-unfolded-one-year-after-the-first-case/
+
